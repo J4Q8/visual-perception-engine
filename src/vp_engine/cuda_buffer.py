@@ -48,6 +48,7 @@ class CUDATimeBuffer(TimeBufferInterface):
         data_signature: dict[str, tuple[int]],
         is_original_process: bool = True,
         device_id: int = 0,
+        max_concurrent_reads: int = 1,
         add_batch_dim: bool = False,
     ):
         self.max_size = max_size
@@ -60,6 +61,7 @@ class CUDATimeBuffer(TimeBufferInterface):
         )
         self.is_original_process = is_original_process
         self.device_id = device_id
+        self.max_concurrent_reads = max_concurrent_reads
         self.add_batch_dim = add_batch_dim
         self.logger = mp.get_logger()
 
@@ -75,6 +77,11 @@ class CUDATimeBuffer(TimeBufferInterface):
         )
 
         self._position_locks = [mp.Lock() for _ in range(max_size)]
+        # special set of semaphores where each one starts with 0 counter, whenever read is happening counter will be increased to 1 via release. Then writer can check if anybody is currently reading
+        self._position_semaphores = [mp.Semaphore(self.max_concurrent_reads) for _ in range(max_size)]
+        for sem in self._position_semaphores:
+            for _ in range(self.max_concurrent_reads):
+                sem.acquire()
         self._newest_idx = mp.Value("i", max_size - 1)
         self._oldest_idx = mp.Value("i", 0)
 
@@ -175,6 +182,9 @@ class CUDATimeBuffer(TimeBufferInterface):
             self._oldest_idx.value = (oldest_idx + 1) % self.max_size
 
         with self._position_locks[oldest_idx]:
+            # wait until all reads are finished
+            while self._position_semaphores[oldest_idx].acquire(False):
+                pass
             self._buffer[oldest_idx].write(item, item_id, sync)
 
         with self._newest_idx.get_lock():
@@ -187,25 +197,15 @@ class CUDATimeBuffer(TimeBufferInterface):
 
         newest_idx = self._newest_idx.value
         with self._position_locks[newest_idx]:
-            timestamp = self._buffer[newest_idx].get_timestamp()
-            if timestamp == float("-inf") or timestamp <= last_timestamp:
-                return None
-            return self._buffer[newest_idx].read(self._output_slot, sync)
-    
-    def get_nowait(self, last_timestamp: float, sync: bool = False) -> None | tuple[int, float, torch.Tensor]:
-        # initialize the output slot the first time it is needed
-        if self._output_slot is None:
-            self._output_slot = self._buffer[0].get_non_shared_empty_memory_slot(self.output_device)
-
-        newest_idx = self._newest_idx.value
-        with nonblocking(self._position_locks[newest_idx]) as locked:
-            if locked:
-                timestamp = self._buffer[newest_idx].get_timestamp()
-                if timestamp == float("-inf") or timestamp <= last_timestamp:
-                    return None
-                return self._buffer[newest_idx].read(self._output_slot, sync)
-            else:
-                return None
+            self._position_semaphores[newest_idx].release()
+        
+        timestamp = self._buffer[newest_idx].get_timestamp()
+        if timestamp == float("-inf") or timestamp <= last_timestamp:
+            return None
+        
+        data = self._buffer[newest_idx].read(self._output_slot, sync)
+        self._position_semaphores[newest_idx].acquire()
+        return data
 
 class LockedBufferWriter:
     def __init__(self, buffer: CUDATimeBuffer):
@@ -224,7 +224,11 @@ class LockedBufferWriter:
             self.buffer._oldest_idx.value = (self.oldest_idx + 1) % self.buffer.max_size
         
         self.current_lock = self.buffer._position_locks[self.oldest_idx]
+        # wait until all reads are finished
+        while self.buffer._position_semaphores[self.oldest_idx].acquire(False):
+            pass
         self.current_lock.acquire()
+        self.buffer._position_semaphores[self.oldest_idx].release()
         
         return self.buffer._buffer[self.oldest_idx].memory_dict
             

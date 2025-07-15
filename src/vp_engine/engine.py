@@ -216,6 +216,7 @@ class Engine:
             output_device="cuda",
             data_signature=fm_model_card.output_signature,
             add_batch_dim=False,
+            max_concurrent_reads=len(head_model_cards),
         )
         self.output_queues = []
         for i in range(len(head_model_cards)):
